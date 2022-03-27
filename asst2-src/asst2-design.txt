@@ -1,0 +1,161 @@
+Design document
+author:
+Zhizhou Ma - z5330482
+Anran   Li - z5183829
+
+What data structures have you added and what function do they perform? 
+	Per-process fd_table and global file_table were implemented. Please see the following section for more details.  
+
+What are any significant issues surround managing the data structures and state do they contain? 
+	As of the basic assignment the global file table is un-synchronised; concurrent access to file_table may introduce race conditions, and hence corrupt file access.  
+	Multi-threaded applications may introduce race conditions in the per-process fd_table.  
+	The global file table is of a fixed size (equal to OPEN_MAX). The spec stated that it is valid to assume no more than 128 files are open at once, 
+	but a dynamic data structure would be more scalable.  
+
+What data structures are per-process and what structures are shared between processes? 
+	The data structures per-process are fd table that store all fd for that process 
+	A global open file table, file_table, is shared between processes. 
+
+Are there any issues related to transferring data to and from applications?  
+	Without lock implementations, un-synchronised table access could corrupt the data and files 
+	Concurrent applications that open the same file may introduce race conditions/ data corruption 
+
+If fork() was implemented, what concurrency issues would be introduced to your implementation? 
+	A entry in file_table can be accessed from different process thus resulting in concurrency issues like data overwritten, 
+	invalid file access, and other problems due to race conditions.  
+
+
+
+Data structures, helper functions and other additions: 
+
+proc.h and proc.c: 
+	FD_UNUSED: 
+		A constant that replaces a value in fd_table to signify that the file descriptor is unused.  
+		FD_UNUSED is set to –1.  
+	fd_table: 
+		fd_table represents the process file descriptor table. It is added to struct proc in proc.h, and 
+		has a size of OPEN_MAX = 128. If fd_table[i] == FD_UNUSED for any 0 <= i < OPEN_MAX, the file 	 
+		descriptor i is assumed to be unused, and get_unused_fd() in file.h may return i as a possible  
+		unused file descriptor.  
+	fd_table initializer: 
+		In proc_create(), all values in fd_table for each process is initialized to FD_UNUSED. 
+
+file.h and file.c: 
+	struct fp: 
+		Our implementation of the file pointer. It has two values:  
+			offset: a variable of type off_t representing the offset from the beginning of the file 
+			flag: a variable of type int, representing the file’s open flags.  
+			fd_count: a variable of type int, represents the number of process fd pointing to this file table entry
+
+	struct ft_node: 
+		A struct representing a single element in file_table. It has two values: 
+			fp: a variable of type struct fp, defined above 
+			vnode_ptr: a pointer to a vnode 
+
+	file_table: 
+		file_table represents the global open file table. It has a max size of OPEN_MAX = 128. Each 	 
+		value is a struct ft_node. There are many operations on file_table which are defined below. 
+
+	void set_ft_unused(int): 
+		Sets an index in file_table such that check_ft_unused() returns 1. In other words, it specifies  
+		that this specific value in file_table can be re-allocated as needed. 
+
+	void check_ft_unused(int): 
+		Checks if an index in file_table is unused.  
+
+	void ft_init(void): 
+		Initializes file_table. This function is called in boot() in main.c. set_ft_unused is called on each 	
+		value in file_table. 
+
+	int get_unused_ftindex(int*): 
+		Finds the first unused index in file_table and places it in the given pointer.  
+		Returns 0 on success, ENFILE as a possible error.  
+
+	int get_unused_fd(int*):
+		Finds the first unused fd in fd_table for the current process, placing this fd in the given pointer.
+		Returns 0 on success, EMFILE as a possible error. 
+
+	void ft_decrease_count(int):
+		Decreases the fd_count for the file pointer at the given index in the file table. If fd_count <= 0,
+		we assume the file table entry is now unused, so we close the respective vnode and call set_ft_unused(). 
+
+	int sys_open_fp(char*, int, int, int*): 
+		Function that serves two purposes: helper function for sys_open and attaching file descriptors 	
+		1 and 2 to the console in runprogram.c. This function makes use of vfs_open() to open the  
+		given file/device path, and saves the necessary information inside a free slot in file_table. It  
+		saves the relevant file_table index inside the given pointer.  
+		The new file_table entry starts with an fd_count equal to 1.
+		Returns 0 on success. It may return errors passed from vfs_open() and get_unused_ftindex(). 
+
+
+Syscall functions: 
+
+
+sys_open(): 
+
+	Open from finding unused fd_table and file_table entry, then open file by call vfs_open. 
+	
+	Possible errors: EMFILE, any error passed from copyinstr, any error passed from sys_open_fd (more info above)
+
+sys_ close(): 
+
+	If invalid fd, return bad file number. Otherwise, call ft_decrease_count on the respective file table entry, 
+	and set the fd in the current process to unused. 
+
+	Possible errors: EBADF
+
+sys_ read(): 
+
+	Check if fd is valid, if not return EBADF 
+
+	Initialize uio with input arguments and stored offset 
+
+	Utilizing VOP_READ to read from file_table.vnode with index from fd_table[fd] 
+
+	On success, sets retval to number of bits written and increment offset with retval 
+
+	Possible errors: EBADF, any error passed from VOP_READ
+
+sys_ write(): 
+
+	Check if fd is valid, if not return EBADF 
+
+	Initinalize uio with input arguments and stored offset 
+
+	Utilizing VOP_WRITE to write to file_table.vnode with index from fd_table[fd] 
+
+	On success, sets retval to number of bits written and increment offset with retval 
+
+	Possible errors: EBADF, any error passed from VOP_WRITE
+
+sys_ dup2(): 
+
+	Check if oldfd is valid and used, if not return EBADF for bad file number 
+
+	call ft_decrease_count() on the file table entry pointed to by newfd (if newfd is currently in use), 
+	and set newfd entry to oldfd entry by modifying the fd_table and open_file table.
+
+	if a file descriptor is successfully duplicated, we increase fd_count for the file table entry in question. 
+
+	Possible errors: EBADF
+
+sys_lseek(): 
+
+	Check if fd is valid, if not return bad file number 
+
+	Check if fd is seekable, if not return ESPIPE illegal seek 
+
+	Return illegal seek if whence invalid, otherwise set the file_table[fd_table[fd]].fp.offset with correct value by whence. 
+
+	Return value set to final offset, return success. 
+
+	Possible errors: EBADF, ESPIPE, any error passed from VOP_STAT
+
+For lseek syscall: 
+
+	Connect registers a2 and a3 to a 64 bit offset, fetch the whence from sp,
+
+	Calls sys_lseek and places the return value in retval64
+
+	Finally, splits retval64 and stores the resulting values in retval and v1 
+	 (the function then replaces v0 with retval if no error is returned) 
